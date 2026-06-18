@@ -98,7 +98,8 @@ async def chat_with_ai(
     
     payload = {
         # Using Gemini 1.5 Flash via OpenRouter for blazing fast, low-cost multimodal/text execution
-        "model": "google/gemini-flash-1.5", 
+        # "model": "google/gemini-flash-1.5", 
+        "model": "openrouter/free",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
