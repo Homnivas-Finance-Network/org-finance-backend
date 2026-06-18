@@ -1,73 +1,130 @@
 import os
 import json
+import logging
 import requests
-from fastapi import FastAPI, HTTPException, Depends
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
 
-app = FastAPI(title="Homnivas Finance API")
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Enable CORS so your PWA (partner.homnivas.space) can securely talk to this API
+app = FastAPI(
+    title="Homnivas Finance Network API",
+    description="Backend engine powering AI loan extraction, tracking, and partner operations.",
+    version="1.0.0"
+)
+
+# Configure CORS
+# In production, replace "*" with your exact PWA domain (e.g., "https://partner.homnivas.space")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Change this to your exact PWA domain later for production security
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Firebase Admin SDK
-# When running on Cloud Run, it can automatically inherit permissions if configured, 
-# or you can load a service account JSON file.
+# Safe Firebase Admin SDK Initialization
 if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault() # Inherits Google Cloud Project credentials automatically
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': 'YOUR_PROJECT_ID.appspot.com' # Replace with your Firebase storage bucket name
-    })
+    try:
+        # For Google Cloud Run production environment (uses default service account)
+        firebase_admin.initialize_app()
+        logger.info("Firebase Admin initialized successfully via Application Default Credentials.")
+    except Exception as e:
+        logger.warning(f"Default Firebase initialization skipped/failed: {e}")
+        # Local development fallback
+        service_account_path = "serviceAccountKey.json"
+        if os.path.exists(service_account_path):
+            cred = credentials.Certificate(service_account_path)
+            firebase_admin.initialize_app(cred)
+            logger.info("Firebase Admin initialized successfully via local serviceAccountKey.json.")
+        else:
+            logger.critical("Firebase Admin could not be initialized. Check credential configurations.")
 
 db = firestore.client()
 
 @app.get("/")
 def read_root():
-    return {"status": "Homnivas Finance Backend is Running"}
+    """Health check endpoint to ensure the container is alive and listening."""
+    return {
+        "status": "healthy",
+        "organization": "Homnivas Finance Network",
+        "service": "Core Python AI Engine"
+    }
 
 @app.post("/api/chat")
-async def chat_with_ai(user_message: str, broker_id: str):
+async def chat_with_ai(
+    user_message: str = Body(..., embed=True), 
+    broker_id: str = Body(..., embed=True),
+    language: Optional[str] = Body("en", embed=True)
+):
     """
-    Receives text from the broker PWA, injects business logic context, 
-    and returns a response from OpenRouter AI.
+    Main chat terminal for brokers. Integrates with OpenRouter AI 
+    to process loan inquiries, parse pasted data blocks, and guide document workflow.
     """
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
     if not openrouter_api_key:
-        raise HTTPException(status_code=500, detail="OpenRouter API Key missing on server configuration.")
+        logger.error("Missing OPENROUTER_API_KEY environment variable.")
+        raise HTTPException(status_code=500, detail="Internal server configuration error.")
         
-    # 1. Fetch system prompt rules (You can store this rule sheet in Firestore!)
+    # Injecting the master platform persona into the system instructions
     system_prompt = (
-        "You are 'Homnivas Finance Network', a premium, highly smart AI assistant for loan brokers in West Bengal. "
-        "Your tone is warm, encouraging, helpful, and professional. Speak in English, Bengali, or Hindi based on user preference. "
-        "Help them extract client data for Home, Personal, Business, and Mortgage loans. "
-        "Analyze text fields or copy-pasted data to look for Name, Income, Loan Amount, and Profession."
+        "You are 'Homnivas Loan Finance Manager', a premium, highly intelligent financial AI assistant operating "
+        "as a digital branch manager for Homnivas Finance Network. Your primary job is to assist outskirt loan partners "
+        "and brokers in West Bengal to onboard files seamlessly.\n\n"
+        
+        "CRITICAL RULES:\n"
+        "1. TONE: Warm, encouraging, entrepreneurial, professional, and accessible to a layman.\n"
+        "2. LANGUAGES: Fully fluent in English, Bengali, and Hindi. Always detect the user's input language/dialect "
+        "and reply to them using that exact linguistic comfort zone (including conversational code-switching like 'Benglish' or 'Hinglish').\n"
+        "3. DATA CAPTURE: Look out for key data points: Client Name, Income, Loan Type (Home, Personal, Business, Mortgage), "
+        "and Employment Type. If the broker copy-pastes a chaotic chunk of text or a WhatsApp forward containing client details, "
+        "do not ask redundant questions. Process what is there, confirm the parameters beautifully like a clean summary table, "
+        "and politely request only the missing pieces or document pictures (PAN card, bank statement, etc.).\n"
+        "4. SUPPORT: If the user asks about platform operations or payouts, guide them cleanly on how to use their "
+        "PWA dashboard tabs ('My Clients' 5-stage visual tracker or 'Wealth' request cash-out section)."
     )
     
-    # 2. Structure the payload for OpenRouter
     headers = {
         "Authorization": f"Bearer {openrouter_api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://homnivas.space", # Identifies your app traffic to OpenRouter
+        "X-Title": "Homnivas Finance Network"
     }
     
     payload = {
-        "model": "meta-llama/llama-3-8b-instruct:free", # You can upgrade to Claude/Gemini flash models later easily
+        # Using Gemini 1.5 Flash via OpenRouter for blazing fast, low-cost multimodal/text execution
+        "model": "google/gemini-flash-1.5", 
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
-        ]
+        ],
+        "temperature": 0.3 # Low temperature keeps financial configurations accurate and grounded
     }
     
     try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload))
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions", 
+            headers=headers, 
+            data=json.dumps(payload),
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"OpenRouter API error response: {response.text}")
+            raise HTTPException(status_code=502, detail="Upstream AI provider communication error.")
+            
         response_data = response.json()
         ai_reply = response_data['choices'][0]['message']['content']
         return {"reply": ai_reply}
+        
+    except requests.exceptions.Timeout:
+        logger.error("Timeout connecting to OpenRouter API.")
+        raise HTTPException(status_code=504, detail="AI response timed out. Please try again.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unhandled exception in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server runtime breakdown.")
