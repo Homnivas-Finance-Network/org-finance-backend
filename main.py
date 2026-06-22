@@ -71,14 +71,30 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 CASES_COLLECTION = "cases"
-BROKERS_COLLECTION = "brokers"
+BROKERS_COLLECTION = "brokers"   # partners (phone sign-in) only
+STAFF_COLLECTION = "staff"       # staff + admin (Google sign-in) only
 
-# Comma-separated list of email addresses allowed to sign in via Google as
-# Homnivas staff/admin, e.g. "ops@homnivas.space,founder@homnivas.space"
-# Set this in Cloud Run env vars. Anyone else attempting Google sign-in is
-# rejected — only phone OTP is open to the public (partners/brokers).
+# Two Google-login allowlists, set as Cloud Run env vars:
+#
+#   STAFF_EMAILS  — the backend team. Anyone here can sign in via Google as
+#                   role "staff": they can see every partner as they sign up
+#                   and self-claim ("tag") any partner that isn't already
+#                   tagged to someone. They can't move a partner that's
+#                   already tagged to someone else.
+#
+#   ADMIN_EMAILS  — typically just you. Role "admin": everything staff can
+#                   do, plus the power to retag any partner to a different
+#                   staff member at any time (rebalancing, fixing a mistake,
+#                   handling a dispute). Admin emails don't need to also be
+#                   listed in STAFF_EMAILS.
+#
+# Anyone signing in via Google who isn't on either list is rejected. Phone
+# OTP (partners) is unaffected by either of these.
 ADMIN_EMAILS = {
     e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
+}
+STAFF_EMAILS = {
+    e.strip().lower() for e in os.getenv("STAFF_EMAILS", "").split(",") if e.strip()
 }
 
 STAGE_LABELS = {
@@ -110,6 +126,7 @@ def _get_owned_case(case_id: str, broker_uid: str) -> dict:
 
 
 def _get_broker_profile(uid: str) -> Optional[dict]:
+    """Partners only — checks the `brokers` collection."""
     snap = db.collection(BROKERS_COLLECTION).document(uid).get()
     if not snap.exists:
         return None
@@ -118,11 +135,31 @@ def _get_broker_profile(uid: str) -> Optional[dict]:
     return profile
 
 
+def _get_staff_profile(uid: str) -> Optional[dict]:
+    """Staff/admin only — checks the `staff` collection."""
+    snap = db.collection(STAFF_COLLECTION).document(uid).get()
+    if not snap.exists:
+        return None
+    profile = snap.to_dict()
+    profile["uid"] = uid
+    return profile
+
+
+def _get_any_profile(uid: str) -> Optional[dict]:
+    """Checks `brokers` first, then `staff`. Use when the caller doesn't know
+    which collection the user belongs to (e.g. PDF generation, role checks)."""
+    profile = _get_broker_profile(uid)
+    if profile:
+        return profile
+    return _get_staff_profile(uid)
+
+
 def _determine_role(decoded_token: dict) -> str:
     """
-    Decide whether the authenticated user is a 'partner' (signed in via phone
-    OTP — open to anyone) or 'admin' (signed in via Google — restricted to
-    ADMIN_EMAILS). Raises 403 if a Google sign-in isn't on the allowlist.
+    Decide whether the authenticated user is a 'partner' (phone OTP — open to
+    anyone), 'staff' (Google sign-in, on STAFF_EMAILS), or 'admin' (Google
+    sign-in, on ADMIN_EMAILS). Raises 403 if a Google sign-in isn't on either
+    allowlist.
     """
     provider = decoded_token.get("firebase", {}).get("sign_in_provider", "")
 
@@ -131,14 +168,24 @@ def _determine_role(decoded_token: dict) -> str:
 
     if provider == "google.com":
         email = (decoded_token.get("email") or "").lower()
-        if not email or email not in ADMIN_EMAILS:
-            raise HTTPException(
-                status_code=403,
-                detail="This Google account isn't authorized for Homnivas employee access.",
-            )
-        return "admin"
+        if email and email in ADMIN_EMAILS:
+            return "admin"
+        if email and email in STAFF_EMAILS:
+            return "staff"
+        raise HTTPException(
+            status_code=403,
+            detail="This Google account isn't authorized for Homnivas employee access.",
+        )
 
     raise HTTPException(status_code=403, detail="Unsupported sign-in method.")
+
+
+def _require_role(uid: str, allowed_roles: set) -> dict:
+    """Fetch a profile from either collection and enforce it has one of the allowed roles."""
+    profile = _get_any_profile(uid)
+    if not profile or profile.get("role") not in allowed_roles:
+        raise HTTPException(status_code=403, detail="You don't have access to this.")
+    return profile
 
 
 def _build_system_prompt(vertical: str, existing_data: dict, language: str) -> str:
@@ -161,9 +208,12 @@ def _build_system_prompt(vertical: str, existing_data: dict, language: str) -> s
 
         "CRITICAL RULES:\n"
         "1. TONE: Warm, encouraging, entrepreneurial, professional, and accessible to a layman.\n"
-        "2. LANGUAGES: Fully fluent in English, Bengali, and Hindi. Always detect the user's input language/dialect "
-        "and reply to them using that exact linguistic comfort zone (including conversational code-switching like 'Benglish' or 'Hinglish'). "
-        f"The broker's last selected language preference is '{language}', but always prioritize what they actually type in.\n"
+        "2. LANGUAGE: You are fully fluent in English, Bengali (বাংলা), and Hindi (हिंदी). "
+        + {
+            "bn": "The broker has EXPLICITLY switched to Bengali. You MUST respond ENTIRELY in Bengali (বাংলা). Do not write a single word in English — use Bangla script throughout. This is non-negotiable.",
+            "hi": "The broker has EXPLICITLY switched to Hindi. You MUST respond ENTIRELY in Hindi (हिंदी). Do not write a single word in English — use Devanagari script throughout. This is non-negotiable.",
+        }.get(language, "Respond in clear, professional English.")
+        + "\n"
         "3. DATA CAPTURE: This case needs the following fields filled in. If the broker pastes a chaotic chunk of text or a "
         "WhatsApp forward containing client details, do not ask redundant questions — extract what's there. Otherwise, ask "
         "for 2-4 missing fields at a time, grouped naturally by topic (don't interrogate one field per message). Once a field "
@@ -296,7 +346,7 @@ def get_verticals():
 
 @app.get("/api/profile")
 def get_profile(broker=Depends(get_current_broker)):
-    profile = _get_broker_profile(broker["uid"])
+    profile = _get_any_profile(broker["uid"])
     if not profile:
         return {"exists": False}
     return {
@@ -306,6 +356,8 @@ def get_profile(broker=Depends(get_current_broker)):
         "role": profile.get("role", "partner"),
         "phone": profile.get("phone", ""),
         "email": profile.get("email", ""),
+        "tagged_to": profile.get("taggedTo", ""),
+        "tagged_to_name": profile.get("taggedToName", ""),
     }
 
 
@@ -320,7 +372,10 @@ def create_or_update_profile(
 
     role = _determine_role(broker)  # raises 403 for unauthorized Google sign-ins
 
-    profile_ref = db.collection(BROKERS_COLLECTION).document(broker["uid"])
+    # Partners live in `brokers`; staff/admin live in `staff` — they are
+    # separate audiences and must not share the same Firestore collection.
+    collection = BROKERS_COLLECTION if role == "partner" else STAFF_COLLECTION
+    profile_ref = db.collection(collection).document(broker["uid"])
     existing = profile_ref.get()
 
     payload = {
@@ -332,6 +387,9 @@ def create_or_update_profile(
     }
     if not existing.exists:
         payload["createdAt"] = firestore.SERVER_TIMESTAMP
+        if role == "partner":
+            payload["taggedTo"] = ""
+            payload["taggedToName"] = ""
 
     profile_ref.set(payload, merge=True)
 
@@ -342,7 +400,89 @@ def create_or_update_profile(
         "role": role,
         "phone": payload["phone"],
         "email": payload["email"],
+        "tagged_to": payload.get("taggedTo", ""),
+        "tagged_to_name": payload.get("taggedToName", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Team — staff/admin only. Lets the backend team see new partners as they
+# sign up and self-claim ("tag") them. Admin can retag any partner at any
+# time; staff can only claim a partner that isn't tagged to anyone yet.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/team/partners")
+def list_partners(broker=Depends(get_current_broker)):
+    _require_role(broker["uid"], {"staff", "admin"})
+    # Partners only live in the brokers collection — no role filter needed
+    # since this collection only ever contains partners.
+    query = db.collection(BROKERS_COLLECTION).limit(500)
+    results = []
+    for snap in query.stream():
+        p = snap.to_dict()
+        results.append({
+            "uid": snap.id,
+            "name": p.get("name", ""),
+            "phone": p.get("phone", ""),
+            "created_at": p.get("createdAt"),
+            "tagged_to": p.get("taggedTo", ""),
+            "tagged_to_name": p.get("taggedToName", ""),
+        })
+    results.sort(key=lambda r: r["created_at"] or 0, reverse=True)
+    return {"partners": results}
+
+
+@app.get("/api/team/staff")
+def list_staff(broker=Depends(get_current_broker)):
+    _require_role(broker["uid"], {"staff", "admin"})
+    # Staff/admin only live in the staff collection — no role filter needed.
+    query = db.collection(STAFF_COLLECTION).limit(200)
+    results = [
+        {"uid": snap.id, "name": snap.to_dict().get("name", ""), "role": snap.to_dict().get("role", "staff")}
+        for snap in query.stream()
+    ]
+    return {"staff": results}
+
+
+@app.post("/api/team/partners/{partner_uid}/tag")
+def tag_partner(
+    partner_uid: str,
+    staff_uid: Optional[str] = Body(None, embed=True),
+    broker=Depends(get_current_broker),
+):
+    requester = _require_role(broker["uid"], {"staff", "admin"})
+    is_admin = requester.get("role") == "admin"
+
+    partner_ref = db.collection(BROKERS_COLLECTION).document(partner_uid)
+    partner_snap = partner_ref.get()
+    if not partner_snap.exists:
+        raise HTTPException(status_code=404, detail="Partner not found.")
+    current_tag = partner_snap.to_dict().get("taggedTo", "")
+
+    if not is_admin:
+        if current_tag:
+            raise HTTPException(status_code=403, detail="This partner is already tagged. Only an admin can reassign.")
+        if staff_uid != broker["uid"]:
+            raise HTTPException(status_code=403, detail="You can only tag a partner to yourself.")
+
+    if staff_uid:
+        # Validate the target is a real staff/admin member from the staff collection
+        staff_snap = db.collection(STAFF_COLLECTION).document(staff_uid).get()
+        if not staff_snap.exists or staff_snap.to_dict().get("role") not in ("staff", "admin"):
+            raise HTTPException(status_code=400, detail="Invalid staff member.")
+        staff_name = staff_snap.to_dict().get("name", "")
+    else:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="Only an admin can unassign a partner.")
+        staff_name = ""
+
+    partner_ref.update({
+        "taggedTo": staff_uid or "",
+        "taggedToName": staff_name,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+
+    return {"uid": partner_uid, "tagged_to": staff_uid or "", "tagged_to_name": staff_name}
 
 
 # ---------------------------------------------------------------------------
@@ -386,12 +526,12 @@ def create_case(
 
 @app.get("/api/cases")
 def list_cases(broker=Depends(get_current_broker)):
-    query = (
-        db.collection(CASES_COLLECTION)
-        .where("brokerId", "==", broker["uid"])
-        .order_by("updatedAt", direction=firestore.Query.DESCENDING)
-        .limit(200)
-    )
+    # Note: deliberately no .order_by() chained onto the .where() here —
+    # combining an equality filter with an order_by on a *different* field
+    # requires a Firestore composite index that doesn't exist by default and
+    # would fail at runtime on a fresh project. Sorting the (small, per-broker)
+    # result set in Python sidesteps that entirely.
+    query = db.collection(CASES_COLLECTION).where("brokerId", "==", broker["uid"]).limit(200)
     results = []
     for snap in query.stream():
         case = snap.to_dict()
@@ -407,6 +547,7 @@ def list_cases(broker=Depends(get_current_broker)):
             "progress": progress(vertical, data),
             "updated_at": case.get("updatedAt"),
         })
+    results.sort(key=lambda r: r["updated_at"] or 0, reverse=True)
     return {"cases": results}
 
 
@@ -555,7 +696,7 @@ def generate_pdf(case_id: str, broker=Depends(get_current_broker)):
     data = case.get("data", {})
     client_label = data.get("name") or "New Lead"
 
-    profile = _get_broker_profile(broker["uid"])
+    profile = _get_any_profile(broker["uid"])
     broker_name = (profile and profile.get("name")) or broker.get("phone_number") or broker.get("email", "")
 
     pdf_bytes = generate_infosheet_pdf(vertical, case_id, broker_name, client_label, data)
