@@ -6,3 +6,4 @@ openai==1.51.0
 pypdf==4.3.1
 pydantic-settings==2.5.2
 python-multipart==0.0.9
+setuptools==74.1.2
