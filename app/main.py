@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routes import payments, analytics, leads
+from app.routes import payments, analytics, leads, profile
 
 app = FastAPI(title="Homnivas Finance Pro API")
 
@@ -17,6 +17,7 @@ app.add_middleware(
 app.include_router(payments.router)
 app.include_router(analytics.router)
 app.include_router(leads.router)
+app.include_router(profile.router)
 
 
 @app.get("/health")

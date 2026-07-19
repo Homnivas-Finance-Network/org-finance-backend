@@ -195,3 +195,74 @@ async def declare_fd(declaredAmount: float = Form(...), uid: str = Depends(get_v
         merge=True,
     )
     return {"status": "recorded"}
+
+
+ADVISOR_SYSTEM_PROMPT = """
+You are Arth, a calm and direct personal finance advisor for an Indian user.
+You have their real financial analysis below — use it specifically, don't give
+generic advice. Keep answers under 120 words, plain language, no jargon unless
+you define it. You are not a licensed financial advisor and cannot recommend
+specific loans, stocks, or insurance products by name — you can explain
+tradeoffs and point them to what to consider.
+"""
+
+
+@router.post("/ask")
+async def ask_advisor(question: str = Form(...), uid: str = Depends(get_verified_uid)):
+    """Step 9's 'Ask Arth anything' — grounded in the user's actual latest
+    analysis, not a generic chatbot. Requires a completed /analyze run first."""
+    user_doc = db.collection("users").document(uid).get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    user_data = user_doc.to_dict()
+    analysis_id = user_data.get("latestAnalysisId")
+    if not analysis_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Run an analysis first — upload your CIBIL report and bank statement.",
+        )
+
+    analysis_doc = (
+        db.collection("users").document(uid).collection("analysisRuns").document(analysis_id).get()
+    )
+    analysis_data = analysis_doc.to_dict() if analysis_doc.exists else {}
+
+    context = (
+        f"Arth Score: {analysis_data.get('arthScore')}\n"
+        f"CIBIL: {analysis_data.get('actualCibil')}\n"
+        f"Monthly salary: {analysis_data.get('monthlySalary')}\n"
+        f"Total current EMI: {analysis_data.get('totalCurrentEmi')}\n"
+        f"Debt reduction roadmap: {analysis_data.get('debtReductionRoadmap')}\n"
+        f"Chart data: {analysis_data.get('chartData')}\n"
+        f"Eligible for 1-EMI consolidation: {analysis_data.get('ELIGIBLE_FOR_1_EMI')}\n"
+    )
+
+    try:
+        response = _call_ai_simple(context, question)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Advisor is busy, try again shortly: {e}")
+
+    return {"answer": response}
+
+
+def _call_ai_simple(context: str, question: str, retries: int = 1) -> str:
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = ai_client.chat.completions.create(
+                model=settings.OPENROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": ADVISOR_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Financial data:\n{context}\n\nQuestion: {question}"},
+                ],
+                temperature=0.4,
+                extra_headers={"HTTP-Referer": settings.APP_URL, "X-Title": "Homnivas Finance Pro"},
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(2)
+                continue
+    raise last_error
