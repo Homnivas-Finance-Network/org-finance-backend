@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Cloud Run injects PORT at runtime — do not hardcode 8080 in code, only here as a default
+ENV PORT=8080
 EXPOSE 8080
 
-# FIX: Changed main.py:app to main:app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
