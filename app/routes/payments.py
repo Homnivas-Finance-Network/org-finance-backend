@@ -97,3 +97,37 @@ async def razorpay_webhook(request: Request):
 
     event_ref.set({"type": event_type, "processedAt": firestore.SERVER_TIMESTAMP})
     return {"status": "processed"}
+
+
+@router.post("/dev-grant-pro")
+async def dev_grant_pro(uid: str = Depends(get_verified_uid)):
+    """Testing-only shortcut that skips Razorpay entirely and marks the
+    calling user Pro directly — same end state as a real successful payment,
+    none of the checkout flow.
+
+    Safe by construction, not just by convention:
+    - Requires a valid Firebase token (get_verified_uid) — can only ever act
+      on the caller's own account, never anyone else's.
+    - Hard-disabled unless ALLOW_DEV_BYPASS=true is explicitly set as an env
+      var. Defaults False. If you're reading this in production logs and
+      didn't expect this endpoint to work, check that env var first.
+
+    Turn ALLOW_DEV_BYPASS off (or just delete the env var) before any real
+    user could reach this build — while it's on, anyone with a Firebase
+    account can get Pro for free by calling this endpoint directly.
+    """
+    if not settings.ALLOW_DEV_BYPASS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dev bypass is disabled. Set ALLOW_DEV_BYPASS=true in Cloud Run env vars to enable for testing.",
+        )
+
+    db.collection("users").document(uid).set(
+        {
+            "isPro": True,
+            "payment": {"status": "COMPLETED", "paymentId": "dev-bypass", "orderId": "dev-bypass"},
+            "journey": {"completedSteps": firestore.ArrayUnion(["PAYMENT_COMPLETED"])},
+        },
+        merge=True,
+    )
+    return {"status": "granted", "warning": "This was a dev bypass, not a real payment."}

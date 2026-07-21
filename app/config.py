@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # starts 404ing, check openrouter.ai/models filtered to Price: Free and swap this.
     OPENROUTER_API_KEY: str
     OPENROUTER_MODEL: str = "meta-llama/llama-3.3-70b-instruct:free"
-    APP_URL: str = "https://homnivas.in"  # sent as HTTP-Referer to OpenRouter, cosmetic only
+    APP_URL: str = "https://finance.homnivas.space/"  # sent as HTTP-Referer to OpenRouter, cosmetic only
 
     # Firebase — paste the full service account JSON as one line into this env var in production.
     # Leave empty locally and keep a service-account.json file in the project root instead (gitignored).
@@ -22,8 +22,14 @@ class Settings(BaseSettings):
 
     ENVIRONMENT: str = "production"
 
+    # DANGER: when true, ANY authenticated user can grant themselves Pro
+    # without paying via POST /api/payments/dev-grant-pro. Only ever set
+    # this to true in a local/dev Cloud Run env var during testing — never
+    # in the production service. Defaults off so a forgotten deploy is safe.
+    ALLOW_DEV_BYPASS: bool = False
+
     # comma-separated list of frontend origins allowed to call this API
-    ALLOWED_ORIGINS: str = "https://thegreydiary.pages.dev"
+    ALLOWED_ORIGINS: str = "https://finance.homnivas.space, https://org-finance-pwa.pages.dev"
 
     class Config:
         env_file = ".env"
