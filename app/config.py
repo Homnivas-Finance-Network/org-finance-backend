@@ -10,11 +10,14 @@ class Settings(BaseSettings):
 
     # OpenRouter — free tier, request-count limited rather than token-limited,
     # which fits long bank statement / CIBIL PDFs well.
-    # Free model list rotates on OpenRouter without much notice — if OPENROUTER_MODEL
-    # starts 404ing, check openrouter.ai/models filtered to Price: Free and swap this.
+    # Default is OpenRouter's own auto-router: it picks whichever currently-free
+    # model matches the request's needs (e.g. structured JSON output), so it
+    # survives individual free models being repriced or pulled. Pin to a named
+    # model instead only if you need consistent behavior more than uptime —
+    # check openrouter.ai/models filtered to Price: Free for current options.
     OPENROUTER_API_KEY: str
-    OPENROUTER_MODEL: str = "meta-llama/llama-3.3-70b-instruct:free"
-    APP_URL: str = "https://finance.homnivas.space/"  # sent as HTTP-Referer to OpenRouter, cosmetic only
+    OPENROUTER_MODEL: str = "openrouter/free"
+    APP_URL: str  # sent as HTTP-Referer to OpenRouter, cosmetic only — set to your real domain
 
     # Firebase — paste the full service account JSON as one line into this env var in production.
     # Leave empty locally and keep a service-account.json file in the project root instead (gitignored).
@@ -29,7 +32,7 @@ class Settings(BaseSettings):
     ALLOW_DEV_BYPASS: bool = False
 
     # comma-separated list of frontend origins allowed to call this API
-    ALLOWED_ORIGINS: str = "https://finance.homnivas.space, https://org-finance-pwa.pages.dev"
+    ALLOWED_ORIGINS: str
 
     class Config:
         env_file = ".env"

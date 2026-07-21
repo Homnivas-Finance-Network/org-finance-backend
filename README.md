@@ -77,9 +77,9 @@ or 1,000/day after a one-time, non-expiring $10 top-up) — so a 15K-token
 document call costs the same "1 request" as a 500-token one.
 
 1. [openrouter.ai/keys](https://openrouter.ai/keys) → sign up, no card needed → **Create Key** → put it in `OPENROUTER_API_KEY`.
-2. Default model is set to `meta-llama/llama-3.3-70b-instruct:free` in `config.py`. **Free model IDs on OpenRouter rotate without much notice** — if you start seeing 404s, go to [openrouter.ai/models](https://openrouter.ai/models), filter to Price: Free, pick a large-context replacement, and update `OPENROUTER_MODEL` in Cloud Run (no code change needed, it's an env var).
+2. Default model is `openrouter/free` in `config.py` — OpenRouter's own auto-router, which picks whichever currently-free model matches the request's needs. **This isn't theoretical: `meta-llama/llama-3.3-70b-instruct:free` (the original pin) was repriced to paid-only in the field**, breaking `/analyze` with a 404 until the model was switched. The auto-router exists specifically to survive that. If you'd rather pin a named model anyway (more consistent behavior, less uptime resilience), check [openrouter.ai/models](https://openrouter.ai/models) filtered to Price: Free for current options, and update `OPENROUTER_MODEL` in Cloud Run — no code change needed, it's an env var.
 3. **Worth doing on day one**: deposit $10 once (never expires, doesn't need to stay in your balance) to move from 50 to 1,000 free requests/day. At ₹345/analysis-eligible customer, 50/day will feel tight fast; $10 one-time removes that ceiling for a long while.
-4. **Reliability trade-off you're accepting**: free tier is best-effort shared capacity — it can slow down or 429 during peak hours. `analytics.py` already retries once with a short backoff and returns a distinct error the frontend can show as "AI is busy, try again shortly." If reliability becomes a real problem at volume, the fix is a paid OpenRouter model (one line: change `OPENROUTER_MODEL`, drop the `:free` suffix) — not a full provider migration.
+4. **Reliability trade-off you're accepting**: free tier is best-effort shared capacity — it can slow down or 429 during peak hours, and the auto-router can pick a different underlying model between calls (fine for structured JSON extraction, worth knowing if output tone/style ever needs to feel consistent). `analytics.py` already retries once with a short backoff and returns a distinct error the frontend can show as "AI is busy, try again shortly." If reliability becomes a real problem at volume, the fix is a paid OpenRouter model (one line: change `OPENROUTER_MODEL` to a specific paid slug) — not a full provider migration.
 5. Free models don't all honor strict JSON-mode reliably. `_parse_json_response()` in `analytics.py` handles this — strips markdown fences and falls back to extracting the outermost `{...}` block if a model wraps its answer in extra text.
 
 ---
@@ -97,10 +97,10 @@ document call costs the same "1 request" as a 500-token one.
 On the same create/edit screen: **Container(s) → Variables & Secrets tab → Variables → + Add Variable**. Add every one of these directly — no Secret Manager step:
 ```
 PLATFORM_FEE=345
-OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free
+OPENROUTER_MODEL=openrouter/free
 ENVIRONMENT=production
 ALLOWED_ORIGINS=https://yourfrontend.pages.dev
-APP_URL=https://homnivas.in
+APP_URL=https://finance.homnivas.space
 
 RAZORPAY_KEY_ID=rzp_live_xxxxxxxxxxxx
 RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxxxxxx
@@ -116,7 +116,7 @@ One thing to know since you're skipping Secret Manager: plain Variables are visi
 Once deployed, copy the Cloud Run service URL (looks like `https://homnivas-finance-pro-xxxxx.a.run.app`), go back to Razorpay's webhook settings (Section 2, step 3), and set the URL to `<that-url>/api/payments/webhook`.
 
 ### Custom domain (optional, for production)
-Cloud Run service → **Manage Custom Domains** → map e.g. `api.homnivas.in` → follow the DNS verification steps shown. Update `ALLOWED_ORIGINS` and Razorpay's webhook URL to match if you do this.
+Cloud Run service → **Manage Custom Domains** → map e.g. `api.homnivas.space` → follow the DNS verification steps shown. Update `ALLOWED_ORIGINS` and Razorpay's webhook URL to match if you do this.
 
 ---
 
