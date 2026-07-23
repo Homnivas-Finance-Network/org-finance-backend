@@ -18,7 +18,13 @@ router = APIRouter(prefix="/api/analytics", tags=["AI Engine"])
 # OpenRouter exposes an OpenAI-compatible endpoint — same client, different base_url.
 ai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=settings.OPENROUTER_API_KEY)
 
-MAX_FILE_BYTES = 8 * 1024 * 1024  # 8MB per PDF
+MAX_FILE_BYTES = 13 * 1024 * 1024  # 13MB per PDF
+# Cloud Run has a hard 32MB limit on the TOTAL request body — platform-level,
+# not configurable in app code. Two files at 13MB + multipart boundary/header
+# overhead stays safely under that. Do not raise this without also solving
+# the Cloud Run ceiling (e.g. direct-to-Cloud-Storage signed URL upload
+# instead of sending the file through this endpoint) — otherwise larger
+# files just get a 413 from the platform before this code ever runs.
 
 # OpenRouter's free tier (":free" model IDs) is gated by REQUEST count
 # (20/min, 50-1000/day depending on whether you've ever topped up $10),
@@ -32,6 +38,8 @@ BANK_CHAR_LIMIT = 60000
 SYSTEM_PROMPT = """
 You are a strict financial analysis engine. Output ONLY raw JSON matching this exact structure, nothing else, no markdown code fences, no commentary:
 {
+  "cibilHolderName": (string, the full name printed on the CIBIL report, exactly as written),
+  "bankHolderName": (string, the full name printed on the bank statement / account holder name, exactly as written),
   "arthScore": (number 0-100),
   "actualCibil": (number),
   "monthlySalary": (number),
@@ -42,7 +50,41 @@ You are a strict financial analysis engine. Output ONLY raw JSON matching this e
   "fdSignalDetected": (boolean, true if the bank statement shows FD interest credits, TDS on interest, or term deposit related entries),
   "estimatedFDValue": (number or null, rough estimate from interest credit amounts if detectable, else null)
 }
+
+arthScore must weigh THREE things, not just CIBIL: (1) credit history (CIBIL), (2) EMI burden as a fraction of income, (3) savings rate as a fraction of income. A high CIBIL with zero or near-zero savings and EMIs+expenses consuming all income is a FRAGILE position, not a strong one — do not score it above 60 regardless of CIBIL. Reserve 80+ for cases with genuine savings headroom, not just a clean credit history.
 """
+
+
+def normalize_name(name: str) -> set:
+    """Loose tokenization for name comparison — strips punctuation/titles,
+    lowercases, drops short tokens (initials, "Mr", "Shri" etc.)."""
+    if not name:
+        return set()
+    cleaned = re.sub(r"[^a-zA-Z\s]", " ", name).lower()
+    stopwords = {"mr", "mrs", "ms", "shri", "smt", "dr"}
+    return {tok for tok in cleaned.split() if len(tok) > 1 and tok not in stopwords}
+
+
+def names_plausibly_match(name_a: str, name_b: str) -> bool:
+    """Deterministic check, not left to the model's own judgment — names are
+    security-relevant here, so this runs in Python against the model's
+    extracted fields rather than trusting a model-reported "do these match"
+    boolean. Tolerant of middle names / name-order differences, but requires
+    real evidence: a single shared token (often just a common first name
+    like "Amit") isn't enough on its own when both names have a surname to
+    compare too — "Amit Patel" and "Amit Kumar Shah" must NOT pass just
+    because they share "Amit". Extraction failures (empty name on either
+    side) don't block — that's an OCR/extraction quality problem, not
+    evidence of a mismatch, and shouldn't punish the user for it."""
+    tokens_a = normalize_name(name_a)
+    tokens_b = normalize_name(name_b)
+    if not tokens_a or not tokens_b:
+        return True
+    overlap = tokens_a & tokens_b
+    smaller = min(len(tokens_a), len(tokens_b))
+    if smaller == 1:
+        return len(overlap) >= 1
+    return len(overlap) >= 2 or len(overlap) == smaller
 
 
 def extract_pdf_text(file_bytes: bytes, password: Optional[str] = None) -> str:
@@ -125,7 +167,8 @@ def _call_ai(cibil_text: str, bank_text: str, retries: int = 1) -> dict:
 
 @router.post("/analyze")
 async def analyze_finances(
-    pdfPassword: Optional[str] = Form(None),
+    cibilPassword: Optional[str] = Form(None),
+    bankPassword: Optional[str] = Form(None),
     cibilPdf: UploadFile = File(...),
     bankStatementPdf: UploadFile = File(...),
     uid: str = Depends(get_verified_uid),
@@ -140,8 +183,8 @@ async def analyze_finances(
     bank_raw = await _read_and_validate(bankStatementPdf)
 
     try:
-        cibil_text = extract_pdf_text(cibil_raw)[:CIBIL_CHAR_LIMIT]
-        bank_text = extract_pdf_text(bank_raw, password=pdfPassword)[:BANK_CHAR_LIMIT]
+        cibil_text = extract_pdf_text(cibil_raw, password=cibilPassword)[:CIBIL_CHAR_LIMIT]
+        bank_text = extract_pdf_text(bank_raw, password=bankPassword)[:BANK_CHAR_LIMIT]
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -151,6 +194,17 @@ async def analyze_finances(
         # Surfaced distinctly so the frontend can show "AI is busy, try again in a
         # minute" instead of a generic error.
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
+
+    if not names_plausibly_match(
+        analysis_data.get("cibilHolderName", ""), analysis_data.get("bankHolderName", "")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The name on your CIBIL report doesn't match the name on your bank "
+                "statement. Please make sure both documents belong to the same person."
+            ),
+        )
 
     run_ref = user_ref.collection("analysisRuns").document()
     run_ref.set({**analysis_data, "createdAt": firestore.SERVER_TIMESTAMP})
@@ -175,6 +229,33 @@ async def analyze_finances(
     )
 
     return {**analysis_data, "analysisId": run_ref.id}
+
+
+@router.get("/history")
+async def get_history(uid: str = Depends(get_verified_uid)):
+    """Every /analyze call already gets saved to analysisRuns — this just
+    exposes that as a time series for the Home tab's score history chart."""
+    runs = (
+        db.collection("users")
+        .document(uid)
+        .collection("analysisRuns")
+        .order_by("createdAt")
+        .limit(24)
+        .stream()
+    )
+    history = []
+    for run in runs:
+        data = run.to_dict()
+        created_at = data.get("createdAt")
+        history.append(
+            {
+                "id": run.id,
+                "arthScore": data.get("arthScore"),
+                "actualCibil": data.get("actualCibil"),
+                "createdAt": created_at.isoformat() if created_at else None,
+            }
+        )
+    return {"history": history}
 
 
 @router.post("/eligibility/loan-against-fd/self-declare")
