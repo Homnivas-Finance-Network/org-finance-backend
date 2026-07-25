@@ -84,7 +84,38 @@ document call costs the same "1 request" as a 500-token one.
 
 ---
 
-## 4. Google Cloud Run — deploy the backend
+## 4. Firebase Storage — large PDF uploads (up to 50MB)
+
+CIBIL reports and bank statements go straight from the browser to Cloud
+Storage now, bypassing Cloud Run entirely — its request body has a hard
+32MB limit that no app-level setting can raise, so anything over roughly
+25MB has to skip Cloud Run altogether. This is why.
+
+1. Firebase Console → your project → **Build → Storage** → if it says "Get started", click it and accept the default bucket location (same project, no separate signup).
+2. Copy the bucket name shown there (looks like `your-project.firebasestorage.app` or `your-project.appspot.com` depending on when the project was created) — you need this in **two** places:
+   - Backend: `FIREBASE_STORAGE_BUCKET` env var (Section 5 below)
+   - Frontend: `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET` — same value, already in the frontend's env var list
+3. **CORS — do not skip this one.** The browser uploads directly to Storage via a signed URL, and without CORS configured on the bucket, every browser will silently block the request with a CORS error that has nothing to do with your code being wrong. There's no toggle for this in the Cloud Console UI — it has to be set via a command, easiest done in **Cloud Shell** (the `>_` terminal icon top-right of any Google Cloud Console page, no local install needed):
+   ```bash
+   cat > cors.json << 'EOF'
+   [
+     {
+       "origin": ["https://finance.homnivas.space", "https://org-finance-pwa.pages.dev"],
+       "method": ["PUT"],
+       "responseHeader": ["Content-Type"],
+       "maxAgeSeconds": 3600
+     }
+   ]
+   EOF
+   gcloud storage buckets update gs://YOUR_BUCKET_NAME --cors-file=cors.json
+   ```
+   Replace `YOUR_BUCKET_NAME` with the bucket name from step 2, and replace the `origin` list with your actual frontend domain(s) — add any new domain here (and redeploy nothing — this takes effect immediately) if you ever add a custom domain.
+4. No Firebase Storage **security rules** changes needed — signed URLs authenticate via cryptographic signature, not Firebase Storage Rules, so this bypasses that layer entirely by design.
+5. Uploaded files are deleted from Storage immediately after the backend reads them for analysis — they don't persist. If `/analyze` fails partway through, worst case is an orphaned file sitting in `uploads/{uid}/`; harmless, but you could add a Storage lifecycle rule (delete after 1 day) as a backstop if you want belt-and-suspenders here.
+
+
+
+## 5. Google Cloud Run — deploy the backend
 
 ### First-time setup
 1. Push this repo to GitHub (private repo — it contains no secrets since `.env` and `service-account.json` are gitignored, but keep it private anyway).
@@ -107,6 +138,7 @@ RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxxxxxx
 RAZORPAY_WEBHOOK_SECRET=xxxxxxxxxxxxxxxxxxxx
 OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxx
 FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"...", ...}
+FIREBASE_STORAGE_BUCKET=your-project.firebasestorage.app
 ```
 `FIREBASE_SERVICE_ACCOUNT_JSON` is the entire downloaded JSON file pasted as one line — the Cloud Run variable value field accepts long strings fine, just make sure there are no line breaks in what you paste.
 
@@ -120,7 +152,7 @@ Cloud Run service → **Manage Custom Domains** → map e.g. `api.homnivas.space
 
 ---
 
-## 5. Frontend — Cloudflare Pages
+## 6. Frontend — Cloudflare Pages
 
 Same as your existing workflow: connect the frontend repo, set the build
 output directory, and add one env var pointing it at your Cloud Run API base
@@ -130,12 +162,13 @@ URL. Make sure the frontend attaches the Firebase ID token as
 
 ---
 
-## 6. Go-live checklist
+## 7. Go-live checklist
 
 - [ ] Firestore is in production mode with rules deployed, not left in test mode
 - [ ] Razorpay KYC complete, live keys generated, live webhook configured and tested with a real ₹1 test transaction
 - [ ] OpenRouter $10 top-up done (or you've confirmed the 50/day free cap comfortably covers real launch volume — test with an actual dense 6-month statement, not a short sample)
 - [ ] All env vars set in Cloud Run, `.env` and `service-account.json` confirmed absent from the GitHub repo (`git log --all -- .env service-account.json` should return nothing)
 - [ ] `ALLOWED_ORIGINS` set to your real production frontend domain, not `*`
+- [ ] Storage bucket CORS includes your real production domain (Section 4, step 3) — not just the dev/test domains you set it up with initially
 - [ ] Webhook URL in Razorpay points at the live Cloud Run URL, not a dev/staging one
 - [ ] Basic uptime/error monitoring on the Cloud Run service (Cloud Run's built-in **Logs** and **Metrics** tabs are enough to start — don't need a third-party tool on day one)

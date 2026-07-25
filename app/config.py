@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     # Leave empty locally and keep a service-account.json file in the project root instead (gitignored).
     FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
 
+    # Firebase Storage bucket — same value as the frontend's
+    # NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET. Used to generate signed upload
+    # URLs so large PDFs go straight from the browser to Storage, bypassing
+    # Cloud Run's hard 32MB request body limit entirely.
+    FIREBASE_STORAGE_BUCKET: str
+
     ENVIRONMENT: str = "production"
 
     # DANGER: when true, ANY authenticated user can grant themselves Pro

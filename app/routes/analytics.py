@@ -2,29 +2,31 @@ import io
 import json
 import re
 import time
+import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
+from fastapi import APIRouter, Depends, Form, HTTPException, status
 from firebase_admin import firestore
 from openai import OpenAI
+from pydantic import BaseModel
 from pypdf import PdfReader
 
 from app.config import settings
 from app.database import db
 from app.auth import get_verified_uid
+from app.storage import bucket, generate_upload_url
 
 router = APIRouter(prefix="/api/analytics", tags=["AI Engine"])
 
 # OpenRouter exposes an OpenAI-compatible endpoint — same client, different base_url.
 ai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=settings.OPENROUTER_API_KEY)
 
-MAX_FILE_BYTES = 13 * 1024 * 1024  # 13MB per PDF
-# Cloud Run has a hard 32MB limit on the TOTAL request body — platform-level,
-# not configurable in app code. Two files at 13MB + multipart boundary/header
-# overhead stays safely under that. Do not raise this without also solving
-# the Cloud Run ceiling (e.g. direct-to-Cloud-Storage signed URL upload
-# instead of sending the file through this endpoint) — otherwise larger
-# files just get a 413 from the platform before this code ever runs.
+MAX_FILE_BYTES = 50 * 1024 * 1024  # 50MB per PDF
+# Files upload directly from the browser to Cloud Storage via a signed URL
+# (see /upload-urls below) and this endpoint only ever reads them back out of
+# Storage — the file bytes never pass through Cloud Run's request body, so
+# its hard 32MB limit doesn't apply here. This 50MB ceiling is a deliberate
+# app-level choice, not a platform constraint.
 
 # OpenRouter's free tier (":free" model IDs) is gated by REQUEST count
 # (20/min, 50-1000/day depending on whether you've ever topped up $10),
@@ -102,12 +104,21 @@ def extract_pdf_text(file_bytes: bytes, password: Optional[str] = None) -> str:
         raise ValueError(f"Could not read PDF: {e}")
 
 
-async def _read_and_validate(file: UploadFile) -> bytes:
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=422, detail=f"{file.filename} must be a PDF")
-    raw = await file.read()
-    if len(raw) > MAX_FILE_BYTES:
-        raise HTTPException(status_code=422, detail=f"{file.filename} exceeds 8MB")
+def _download_and_validate(blob_path: str, uid: str, label: str) -> bytes:
+    if not blob_path.startswith(f"uploads/{uid}/"):
+        # Prevents one user passing another user's storage path and reading
+        # their document — paths are namespaced per-uid specifically for this.
+        raise HTTPException(status_code=403, detail="Invalid storage path")
+
+    blob = bucket.blob(blob_path)
+    blob.reload()  # fetch current metadata (size) without downloading content yet
+
+    if blob.size and blob.size > MAX_FILE_BYTES:
+        blob.delete()
+        raise HTTPException(status_code=422, detail=f"{label} exceeds 50MB")
+
+    raw = blob.download_as_bytes()
+    blob.delete()  # don't retain sensitive financial documents after reading them once
     return raw
 
 
@@ -165,26 +176,50 @@ def _call_ai(cibil_text: str, bank_text: str, retries: int = 1) -> dict:
     raise last_error
 
 
+class AnalyzeRequest(BaseModel):
+    cibilStoragePath: str
+    bankStoragePath: str
+    cibilPassword: Optional[str] = None
+    bankPassword: Optional[str] = None
+
+
+@router.post("/upload-urls")
+async def get_upload_urls(uid: str = Depends(get_verified_uid)):
+    """Step 7, before the actual file selection UI does anything: get two
+    signed PUT URLs, one per document. The frontend uploads directly to
+    these — Cloud Run never sees the file bytes, which is what makes files
+    over its 32MB request limit possible at all."""
+    user_ref = db.collection("users").document(uid)
+    user_doc = user_ref.get()
+    if not user_doc.exists or not user_doc.to_dict().get("isPro", False):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Payment required")
+
+    request_id = uuid.uuid4().hex
+    cibil_path = f"uploads/{uid}/{request_id}-cibil.pdf"
+    bank_path = f"uploads/{uid}/{request_id}-bank.pdf"
+
+    return {
+        "cibilUploadUrl": generate_upload_url(cibil_path),
+        "cibilStoragePath": cibil_path,
+        "bankUploadUrl": generate_upload_url(bank_path),
+        "bankStoragePath": bank_path,
+    }
+
+
 @router.post("/analyze")
-async def analyze_finances(
-    cibilPassword: Optional[str] = Form(None),
-    bankPassword: Optional[str] = Form(None),
-    cibilPdf: UploadFile = File(...),
-    bankStatementPdf: UploadFile = File(...),
-    uid: str = Depends(get_verified_uid),
-):
+async def analyze_finances(payload: AnalyzeRequest, uid: str = Depends(get_verified_uid)):
     user_ref = db.collection("users").document(uid)
     user_doc = user_ref.get()
 
     if not user_doc.exists or not user_doc.to_dict().get("isPro", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Payment required")
 
-    cibil_raw = await _read_and_validate(cibilPdf)
-    bank_raw = await _read_and_validate(bankStatementPdf)
+    cibil_raw = _download_and_validate(payload.cibilStoragePath, uid, "CIBIL report")
+    bank_raw = _download_and_validate(payload.bankStoragePath, uid, "Bank statement")
 
     try:
-        cibil_text = extract_pdf_text(cibil_raw, password=cibilPassword)[:CIBIL_CHAR_LIMIT]
-        bank_text = extract_pdf_text(bank_raw, password=bankPassword)[:BANK_CHAR_LIMIT]
+        cibil_text = extract_pdf_text(cibil_raw, password=payload.cibilPassword)[:CIBIL_CHAR_LIMIT]
+        bank_text = extract_pdf_text(bank_raw, password=payload.bankPassword)[:BANK_CHAR_LIMIT]
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
