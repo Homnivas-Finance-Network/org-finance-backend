@@ -402,3 +402,63 @@ def _call_ai_simple(context: str, question: str, retries: int = 1) -> str:
                 time.sleep(2)
                 continue
     raise last_error
+
+class ConfirmNumbersRequest(BaseModel):
+    analysisId: str
+    confirmedMonthlySalary: float
+    confirmedTotalEmi: float
+
+
+CONFIRM_SYSTEM_PROMPT = """
+You are a strict financial analysis engine. The user has just corrected two numbers after reviewing an initial automated analysis: their actual monthly income and actual total monthly EMI. Documents under-report these often — incentive/bonus income gets missed because it isn't labeled "salary", and EMIs for loans that don't report to CIBIL get missed entirely. Given the corrected numbers plus the original CIBIL score, output ONLY raw JSON, nothing else:
+{
+  "arthScore": (number 0-100 — weigh CIBIL, EMI burden vs income, and savings rate. A high CIBIL with EMIs+expenses consuming most/all income is FRAGILE — do not score above 60 in that case),
+  "debtReductionRoadmap": ["step 1", "step 2"],
+  "chartData": {"emis": number, "livingExpenses": number, "savings": number},
+  "ELIGIBLE_FOR_1_EMI": (boolean, true ONLY if actualCibil >= 650)
+}
+chartData.emis should equal confirmedTotalEmi. The three chartData values must sum to confirmedMonthlySalary.
+"""
+
+
+@router.post("/confirm")
+async def confirm_numbers(payload: ConfirmNumbersRequest, uid: str = Depends(get_verified_uid)):
+    run_ref = db.collection("users").document(uid).collection("analysisRuns").document(payload.analysisId)
+    run_doc = run_ref.get()
+    if not run_doc.exists:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    original = run_doc.to_dict()
+    context = (
+        f"CIBIL: {original.get('actualCibil')}\n"
+        f"Confirmed monthly income: {payload.confirmedMonthlySalary}\n"
+        f"Confirmed total monthly EMI: {payload.confirmedTotalEmi}\n"
+        f"Original debt roadmap for reference (loan names/order may still be valid): {original.get('debtReductionRoadmap')}\n"
+    )
+
+    try:
+        raw = _call_ai_simple(context, "Recalculate based on the corrected figures above.")
+        updated = _parse_json_response(raw)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Recalculation failed, try again shortly: {e}")
+
+    run_ref.update(
+        {
+            "monthlySalary": payload.confirmedMonthlySalary,
+            "totalCurrentEmi": payload.confirmedTotalEmi,
+            "arthScore": updated.get("arthScore"),
+            "debtReductionRoadmap": updated.get("debtReductionRoadmap"),
+            "chartData": updated.get("chartData"),
+            "ELIGIBLE_FOR_1_EMI": updated.get("ELIGIBLE_FOR_1_EMI"),
+            "userConfirmed": True,
+        }
+    )
+
+    db.collection("users").document(uid).set(
+        {"eligibility": {"oneEmi": {"eligible": updated.get("ELIGIBLE_FOR_1_EMI", False), "checkedAt": firestore.SERVER_TIMESTAMP}}},
+        merge=True,
+    )
+
+    final = run_ref.get().to_dict()
+    return {**final, "analysisId": payload.analysisId}
+  
