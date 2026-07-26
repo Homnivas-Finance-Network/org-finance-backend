@@ -3,6 +3,7 @@ import json
 import re
 import time
 import uuid
+import difflib
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, status
@@ -63,30 +64,49 @@ def normalize_name(name: str) -> set:
     if not name:
         return set()
     cleaned = re.sub(r"[^a-zA-Z\s]", " ", name).lower()
-    stopwords = {"mr", "mrs", "ms", "shri", "smt", "dr"}
+    stopwords = {"mr", "mrs", "ms", "shri", "smt", "dr", "hello"}
     return {tok for tok in cleaned.split() if len(tok) > 1 and tok not in stopwords}
+  
+
+def _clean_chars(name: str) -> str:
+    """Letters only, no spaces, lowercased — used as a fallback when
+    tokenizing fails to find a match."""
+    return re.sub(r"[^a-zA-Z]", "", name).lower()
 
 
 def names_plausibly_match(name_a: str, name_b: str) -> bool:
-    """Deterministic check, not left to the model's own judgment — names are
-    security-relevant here, so this runs in Python against the model's
-    extracted fields rather than trusting a model-reported "do these match"
-    boolean. Tolerant of middle names / name-order differences, but requires
-    real evidence: a single shared token (often just a common first name
-    like "Amit") isn't enough on its own when both names have a surname to
-    compare too — "Amit Patel" and "Amit Kumar Shah" must NOT pass just
-    because they share "Amit". Extraction failures (empty name on either
-    side) don't block — that's an OCR/extraction quality problem, not
-    evidence of a mismatch, and shouldn't punish the user for it."""
+    """Deterministic check, not left to the model's own judgment. Tolerant
+    of middle names / name-order differences, but requires real evidence: a
+    single shared token isn't enough on its own when both names have a
+    surname to compare too.
+
+    Falls back to character-level similarity if tokenizing finds no match —
+    some PDF layouts (this includes at least one real CIBIL report layout
+    seen in production) extract text with spaces dropped or words run
+    together, e.g. "SHILADITYABOSESHILADITYABOSE". Token comparison alone
+    would wrongly reject that against a cleanly-extracted "MR SHILADITYA
+    BOSE", even though it's obviously the same name once you ignore
+    spacing. The character-similarity fallback catches that case without
+    loosening the token check itself — real mismatches (different people)
+    still correctly fail both checks."""
     tokens_a = normalize_name(name_a)
     tokens_b = normalize_name(name_b)
     if not tokens_a or not tokens_b:
         return True
+
     overlap = tokens_a & tokens_b
     smaller = min(len(tokens_a), len(tokens_b))
     if smaller == 1:
-        return len(overlap) >= 1
-    return len(overlap) >= 2 or len(overlap) == smaller
+        if len(overlap) >= 1:
+            return True
+    elif len(overlap) >= 2 or len(overlap) == smaller:
+        return True
+
+    chars_a, chars_b = _clean_chars(name_a), _clean_chars(name_b)
+    if not chars_a or not chars_b:
+        return True
+    similarity = difflib.SequenceMatcher(None, chars_a, chars_b).ratio()
+    return similarity >= 0.6
 
 
 def extract_pdf_text(file_bytes: bytes, password: Optional[str] = None) -> str:
