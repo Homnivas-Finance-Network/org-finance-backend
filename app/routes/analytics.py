@@ -420,6 +420,33 @@ You are a strict financial analysis engine. The user has just corrected two numb
 chartData.emis should equal confirmedTotalEmi. The three chartData values must sum to confirmedMonthlySalary.
 """
 
+def _call_ai_confirm(context: str, retries: int = 1) -> dict:
+    """Dedicated helper for /confirm — uses CONFIRM_SYSTEM_PROMPT and
+    requests JSON output. Deliberately NOT _call_ai_simple, which is
+    hardcoded to ADVISOR_SYSTEM_PROMPT (plain conversational answers, no
+    JSON mode) and was the actual bug here: reusing it meant the model was
+    correctly following a prompt that told it to write a sentence, not
+    JSON, so parsing it as JSON always failed."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = ai_client.chat.completions.create(
+                model=settings.OPENROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": CONFIRM_SYSTEM_PROMPT},
+                    {"role": "user", "content": context},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                extra_headers={"HTTP-Referer": settings.APP_URL, "X-Title": "Homnivas Finance Pro"},
+            )
+            return _parse_json_response(response.choices[0].message.content)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(2)
+                continue
+    raise last_error
 
 @router.post("/confirm")
 async def confirm_numbers(payload: ConfirmNumbersRequest, uid: str = Depends(get_verified_uid)):
@@ -437,8 +464,7 @@ async def confirm_numbers(payload: ConfirmNumbersRequest, uid: str = Depends(get
     )
 
     try:
-        raw = _call_ai_simple(context, "Recalculate based on the corrected figures above.")
-        updated = _parse_json_response(raw)
+        updated = _call_ai_confirm(context)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Recalculation failed, try again shortly: {e}")
 
